@@ -11,6 +11,9 @@ from torch.optim.lr_scheduler import StepLR
 from typing import List, Tuple, Dict, Optional, Callable
 from Pyfhel import Pyfhel
 
+import time
+start_time = time.time()
+
 HE = Pyfhel()           # Creating empty Pyfhel object
 ckks_params = {
     'scheme': 'CKKS',   # can also be 'ckks'
@@ -95,6 +98,7 @@ def get_parameters2(net) -> List[np.ndarray]:
     #Renvoie une liste avec les poids puis les biais de chaque couche
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
+
 def get_EncryptedParameters2(net) -> List[np.ndarray]:
     #Renvoie une liste avec les poids puis les biais de chaque couche
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
@@ -107,6 +111,8 @@ def encrypt(weights):
     for w in weights:
         if len(w.shape) > 2 :
             encryptedWeights.append(encrypt(w))
+        elif len(w.shape) == 1:
+            encryptedWeights.append(HE.encrypt(w))
         else:
             encryptedWeights.append([HE.encrypt(node) for node in w])
         
@@ -127,7 +133,27 @@ def aggregate(N,aW):
 
     return aggregateLayers
 
+def decrypt(weight, shape):
+    #Fonction récursive pour encrypter chaque node ? 
+    #---- Shape (1,3,3) --> 1 array 3*3
+    #---- Shape (3,3) --> encrypter chaque array de la liste
+    encryptedWeights = []
+    
+    if not isinstance(weight, list):
+        encryptedWeights.append(HE.decryptFrac(weight)[:shape[-1]])
 
+    else :
+        for w in weight :
+            if isinstance(w, list):
+                encryptedWeights.append(decrypt(w, shape))
+                
+            else:
+                _r = lambda x: np.round(x, decimals=8)
+                encryptedWeights.append(_r(HE.decryptFrac(w)[:shape[-1]]))
+            
+           
+        
+    return encryptedWeights
 
 
 def aggregation(N,nLayers,weights):
@@ -135,12 +161,16 @@ def aggregation(N,nLayers,weights):
     #Dans ce cas-ci : 7
     for l in weights :
         aW = []
-    #tous les Models ont la même structure
-        if isinstance(l[0][0], list):
-            moy.append(aggregation(N,len(l[0]), list(zip(*l))))
 
-        else:
-            moy.append([sum([l[n][k] for n in range(N)]) for k in range(len(l[0]))])
+        if not isinstance(l[0], list):
+            moy.append(sum(l))
+    #tous les Models ont la même structure
+        else :
+            if isinstance(l[0][0], list):
+                moy.append(aggregation(N,len(l[0]), list(zip(*l))))
+
+            else:
+                moy.append([sum([l[n][k] for n in range(N)]) for k in range(len(l[0]))])
     return moy
 
 
@@ -219,6 +249,26 @@ def main():
         N = 2 #[ModelW1, ModelW2,..., ModelWn] avec N = nClients
         nLayers = len(weights)
         moy = aggregation(N, nLayers,weights)
+        decrypted = []
+        input_shapes = [p.shape for p in param]
+        for weight, shape in zip(moy, input_shapes):
+            decrypted.append(decrypt(weight,shape))
+        
+        newParam = []
+        
+        #4D : Conv
+        #2D : Linear
+        #1D : biais
+        for i in range(len(decrypted)) :
+            
+            if isinstance(decrypted[i], np.ndarray):
+                #Reshape les biais 
+                newParam.append(np.array(decrypted[i][:param[i].size]))
+            else:
+                #Reshape les poids
+                newParam.append(np.array(decrypted[i], dtype="float32").reshape(param[i].shape))
+        print("--- %s seconds ---" % (time.time() - start_time))
+        newNet = set_parameters(model, newParam)
         test(model, device, test_loader)
         scheduler.step()
 
