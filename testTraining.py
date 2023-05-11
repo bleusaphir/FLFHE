@@ -10,14 +10,14 @@ from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
 from typing import List, Tuple, Dict, Optional, Callable
 from Pyfhel import Pyfhel
-
+import torchmetrics
 import time
-start_time = time.time()
 
+CKKSN = 2**15
 HE = Pyfhel()           # Creating empty Pyfhel object
 ckks_params = {
     'scheme': 'CKKS',   # can also be 'ckks'
-    'n': 2**15,         # Polynomial modulus degree. For CKKS, n/2 values can be
+    'n': CKKSN,         # Polynomial modulus degree. For CKKS, n/2 values can be
                         #  encoded in a single ciphertext. 
                         #  Typ. 2^D for D in [10, 16]
     'scale': 2**30,     # All the encodings will use it for float->fixed point
@@ -31,53 +31,47 @@ ckks_params = {
 HE.contextGen(**ckks_params)  # Generate context for bfv scheme
 HE.keyGen()             # Key Generation: generates a pair of public/secret keys
 HE.rotateKeyGen()
-
+import torchvision
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes=10) -> None:
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, 3, 1)
-        self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(9216, 128)
-        self.fc2 = nn.Linear(128, 10)
+        print("Number of classes : ", num_classes)
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, num_classes)
 
-    def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu(x)
-        x = self.conv2(x)
-        x = F.relu(x)
-        x = F.max_pool2d(x, 2)
-        x = self.dropout1(x)
-        x = torch.flatten(x, 1)
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.dropout2(x)
-        x = self.fc2(x)
-        output = F.log_softmax(x, dim=1)
-        return output
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 5 * 5)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
 
-def train(args, model, device, train_loader, optimizer, epoch):
-    model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
-        optimizer.zero_grad()
-        output = model(data)
-        loss = F.nll_loss(output, target)
-        loss.backward()
-        optimizer.step()
-        if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.item()))
-            if args.dry_run:
-                break
+
+def get_vgg():
+    temp = torchvision.models.vgg16()
+    temp.load_state_dict(temp.state_dict())
+    return temp
+
+
+import torch.nn as nn
+import torch.nn.functional as F
+
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 
 def test(model, device, test_loader):
     model.eval()
+
     test_loss = 0
     correct = 0
     with torch.no_grad():
@@ -94,27 +88,45 @@ def test(model, device, test_loader):
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
     
+
 def get_parameters2(net) -> List[np.ndarray]:
     #Renvoie une liste avec les poids puis les biais de chaque couche
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
+def get_parameters3(state_dict) -> List[np.ndarray]:
+    #Renvoie une liste avec les poids puis les biais de chaque couche
+    return [val.cpu().numpy() for _, val in state_dict.items()]
 
 def get_EncryptedParameters2(net) -> List[np.ndarray]:
     #Renvoie une liste avec les poids puis les biais de chaque couche
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
 def encrypt(weights):
+
+    
+
+    i = 0
     #Fonction récursive pour encrypter chaque node ? 
     #---- Shape (1,3,3) --> 1 array 3*3
     #---- Shape (3,3) --> encrypter chaque array de la liste
     encryptedWeights = []
     for w in weights:
         if len(w.shape) > 2 :
+            i+=1
+            print(f"Récursivité {i}")
             encryptedWeights.append(encrypt(w))
         elif len(w.shape) == 1:
             encryptedWeights.append(HE.encrypt(w))
         else:
-            encryptedWeights.append([HE.encrypt(node) for node in w])
+
+                #Une limitation de taille de CKKSN / 2 par array chiffré est imposée par le module d'encryption.
+                #Afin de contourner ce modèle, on découpe l'array en sous array qu'on crypte par la suite, avant de les réunir à la fin
+                
+                #NB : Ne fonctionne pas car pas possible de refusionner les 2 arrays chiffrés comme des normaux
+                #_n = lambda x: np.split(x, list(range(0,len(node),CKKSN//2))[1:])
+                
+                
+                 encryptedWeights.append([HE.encrypt(node) for node in w])
         
     return encryptedWeights
 
@@ -123,15 +135,7 @@ def set_parameters(net, parameters: List[np.ndarray]):
     state_dict = OrderedDict({k: torch.Tensor(v) for k, v in params_dict})
     net.load_state_dict(state_dict, strict=True)
 
-def aggregate(N,aW):
 
-    aggregateLayers = []
-    if isinstance(aW[0][0], list):
-        aggregateLayers.append(aggregation(N,len(aW[0]),list(zip(*aW))))
-    else:
-        aggregateLayers.append([sum([aW[k][n] for n in range(N)]) for k in range(len(aW))])
-
-    return aggregateLayers
 
 def decrypt(weight, shape):
     #Fonction récursive pour encrypter chaque node ? 
@@ -155,27 +159,57 @@ def decrypt(weight, shape):
         
     return encryptedWeights
 
+def aggregation(N,weights):
 
-def aggregation(N,nLayers,weights):
+    """
+    Applique la mise en commun des modèles de chaque client.
+
+    Parameters:
+    l (tuple) : tuple contenant les poids de la couche de chaque client.
+    N (int) : Nombre de client participant au FL.
+
+    Returns:
+    list: moyenne des poids des clients
+
+
+    """
     moy = []
     #Dans ce cas-ci : 7
     for l in weights :
-        aW = []
 
         if not isinstance(l[0], list):
+            #Poids à une seule dimension
             moy.append(sum(l))
     #tous les Models ont la même structure
         else :
             if isinstance(l[0][0], list):
-                moy.append(aggregation(N,len(l[0]), list(zip(*l))))
+                #Encore 2 dimensions de couches
+                moy.append(aggregation(N, list(zip(*l))))
 
             else:
-                moy.append([sum([l[n][k] for n in range(N)]) for k in range(len(l[0]))])
+                #Une liste de poids cryptés
+                moy.append(moy_agg(l,N))
     return moy
 
+def moy_agg(l,N):
+    """
+    Fonction d'aggregation effectuant une moyenne simple des poids des clients.
 
+    Parameters:
+    l (tuple) : tuple contenant les poids de la couche de chaque client.
+    N (int) : Nombre de client participant au FL.
+
+    Returns:
+    list: moyenne des poids des clients
+
+
+    """
+    return [sum(l[n][k] for n in range(N))/N for k in range(len(l[0]))]
 
 def main():
+    model = get_vgg()
+    
+    start_time = time.time()
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
@@ -203,7 +237,7 @@ def main():
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     use_mps = not args.no_mps and torch.backends.mps.is_available()
-
+    
     torch.manual_seed(args.seed)
 
     if use_cuda:
@@ -232,33 +266,49 @@ def main():
                        transform=transform)
     train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
     test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
-
-    model = Net().to(device)
+    model = Net10().to(device)
+    
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
+    
     for epoch in range(1, args.epochs + 1):
         train(args, model, device, train_loader, optimizer, epoch)
+
+        
+        
+        
+        startEn = time.time()
+        print("[STATUS] : Encryption des poids en cours...")
         param = get_parameters2(model)
         encryptedWeights = encrypt(param)
+        print(f"[SUCCESS] : poids encryptés en {time.time() - startEn}")
         otherW = encryptedWeights.copy()
         weights = []
         weights.append(otherW)
         weights.append(encryptedWeights)
         weights = list(zip(*weights))
         N = 2 #[ModelW1, ModelW2,..., ModelWn] avec N = nClients
-        nLayers = len(weights)
-        moy = aggregation(N, nLayers,weights)
+
+        startAg = time.time()
+        print("[STATUS] : Agreggation des poids en cours...")
+        moy = aggregation(N,weights)
+        print(f"[SUCCESS] : aggregation en {time.time() - startAg}")
+
+        startdec = time.time()
+        print("[STATUS] : Decryption des poids en cours...")
         decrypted = []
         input_shapes = [p.shape for p in param]
         for weight, shape in zip(moy, input_shapes):
             decrypted.append(decrypt(weight,shape))
         
         newParam = []
-        
+        print(f"[SUCCESS] : decryption en {time.time() - startdec}")
         #4D : Conv
         #2D : Linear
         #1D : biais
+        startcons = time.time()
+        print("[STATUS] : Construction du nouveau modèle en cours...")
         for i in range(len(decrypted)) :
             
             if isinstance(decrypted[i], np.ndarray):
@@ -267,14 +317,24 @@ def main():
             else:
                 #Reshape les poids
                 newParam.append(np.array(decrypted[i], dtype="float32").reshape(param[i].shape))
-        print("--- %s seconds ---" % (time.time() - start_time))
-        newNet = set_parameters(model, newParam)
+        
+        
+        
+        set_parameters(model, newParam)
+        print(f"[SUCCESS] : nouveau modèle construit en {time.time() - startcons}")
         test(model, device, test_loader)
+
+
+        print(f"Epoch {epoch} en {time.time() - start_time}")
         scheduler.step()
 
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
 
 
+
+
+
 if __name__ == '__main__':
     main()
+
