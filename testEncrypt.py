@@ -1,3 +1,4 @@
+from io import BytesIO
 import itertools
 import time
 import numpy as np
@@ -182,7 +183,7 @@ def decrypt(encryptedWeights):
     return encryptedWeights
 
 
-
+from flwr.common.typing import NDArray, NDArrays, Parameters
 
 
 #Génerer des poids aléatoires pour n clients
@@ -192,8 +193,39 @@ for client in clients:
     #On encrypte tous les poids de chaque client
     client.encrypt()
 
+def ndarray_to_sparse_bytes(ndarray: NDArray) -> bytes:
+    """Serialize NumPy ndarray to bytes."""
+    bytes_io = BytesIO()
+
+    if len(ndarray.shape) > 1:
+        # We convert our ndarray into a sparse matrix
+        ndarray = torch.tensor(ndarray).to_sparse_csr()
+
+        # And send it by utilizng the sparse matrix attributes
+        # WARNING: NEVER set allow_pickle to true.
+        # Reason: loading pickled data can execute arbitrary code
+        # Source: https://numpy.org/doc/stable/reference/generated/numpy.save.html
+        np.savez(
+            bytes_io,  # type: ignore
+            crow_indices=ndarray.crow_indices(),
+            col_indices=ndarray.col_indices(),
+            values=ndarray.values(),
+            allow_pickle=False,
+        )
+    else:
+        # WARNING: NEVER set allow_pickle to true.
+        # Reason: loading pickled data can execute arbitrary code
+        # Source: https://numpy.org/doc/stable/reference/generated/numpy.save.html
+        np.save(bytes_io, ndarray, allow_pickle=False)
+    return bytes_io.getvalue()
 
 newEncryptedWeights = aggregation(clients) #Moyenne des poids
+
+import pickle
+
+input_shapes = [120,80,70, 60, 50, 40, 30, 20, 10]
+cipher = HE.encrypt(input_shapes)
+dump = pickle.dumps(cipher)
 newWeights = decrypt(newEncryptedWeights) #Decryption des nouveaux poids
 print("Duration time : ", time.time() - startTime)
 print('Yep')

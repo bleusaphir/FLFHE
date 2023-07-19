@@ -35,6 +35,20 @@ HE.rotateKeyGen()
 import torchvision
 
 
+class Client():
+    def __init__(self, model, ) -> None:
+        self.model = model
+        
+        pass
+
+    def encrypt(self):
+        pass
+    def getShapes(self, param):
+        return [p.shape for p in param]
+    def get_parameters(self) -> List[np.ndarray]:
+        #Renvoie une liste avec les poids puis les biais de chaque couche
+        return [val.cpu().numpy().astype('float32') for _, val in net.state_dict().items()]
+
 def get_vgg():
     temp = torchvision.models.googlenet()
     temp.load_state_dict(temp.state_dict())
