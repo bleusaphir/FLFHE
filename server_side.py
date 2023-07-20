@@ -1,3 +1,6 @@
+import flwr as fl
+import sys
+import numpy as np
 import torch
 import torch.nn as nn
 import torchvision
@@ -8,7 +11,6 @@ from torchvision import transforms
 import numpy as np
 from glob import glob
 from going_modular.common import *
-
 from going_modular import model_builder, data_setup, engine
 import torchvision
 # Plot tool
@@ -20,17 +22,13 @@ import torch.nn.functional
 from flwr.common import Metrics
 from flwr.common import Metrics
 from collections import OrderedDict
-
-
-
-
 print("flwr", fl.__version__)
 print("numpy", np.__version__)
 print("torch", torch.__version__)
 print("torchvision", torchvision.__version__)
 from sklearn.metrics import classification_report
 device = "gpu"  #@param ["cpu", "cuda", "mps","gpu"] {type:"string"}
-number_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
+number_clients = 2  #@param {type:"slider", min:3, max:10, step:1}
 num_workers = -1
 epochs = 3  #@param {type:"slider", min:1, max:50, step:1}
 batch_size = 8 #@param [1, 2, 4, 8, 16, 32, 64, 128, 256] {type:"raw"}
@@ -43,7 +41,7 @@ dataset = "cifar"  #@param ["cifar", "animaux", "breast"] {type:"string"}
 split = 10  #@param {type:"slider", min:5, max:100, step:5}
 seed = 42
 length = 32
-lr = 0.01  # 0.05
+lr = 0.00-1  # 0.05
 max_grad_norm = 1.2  # Tuning max_grad_norm is very important : Start with a low noise multiplier like 0.1, this should give comparable performance to a non-private model. Then do a grid search for the optimal max_grad_norm value. The grid can be in the range [0.1, 10].
 epsilon = 50.0  # You can play around with the level of privacy, epsilon : Smaller epsilon means more privacy, more noise -- and hence lower accuracy. One useful technique is to pre-train a model on public (non-private) data, before completing the training on the private training data.
 delta = 1e-5
@@ -57,18 +55,19 @@ NUM_CLASSES = 10
 
 
 
-rounds =10  #@param {type:"slider", min:1, max:50, step:1}
+rounds = 25   #@param {type:"slider", min:1, max:50, step:1}
 frac_fit = 1  #@param {type:"slider", min:0.1, max:1.0, step:0.1}
 frac_eval = 0.5  #@param {type:"slider", min:0.1, max:1.0, step:0.1}
 min_fit_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
 min_eval_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
 min_avail_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
 
-trainloaders, valloaders, testloader = data_setup.load_datasets(num_clients=1, batch_size=batch_size,
+
+
+
+trainloaders, valloaders, testloader = data_setup.load_datasets(num_clients=number_clients, batch_size=batch_size,
                                                                 resize=length, seed=seed,
                                                                 num_workers=num_workers, splitter=split, data_path=data_path)
-
-
 def get_parameters2(net) -> List[np.ndarray]:
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
@@ -111,7 +110,7 @@ def evaluate2(server_round: int, parameters: fl.common.NDArrays, config: Dict[st
     return loss, {"accuracy": accuracy}
 
 
-def get_on_fit_config_fn(epoch=2, lr=0.01, batch_size=32) -> Callable[[int], Dict[str, str]]:
+def get_on_fit_config_fn(epoch=2, lr=0.001, batch_size=32) -> Callable[[int], Dict[str, str]]:
     """Return a function which returns training configurations."""
 
     def fit_config(server_round: int) -> Dict[str, str]:
@@ -141,7 +140,6 @@ class FlowerClient(fl.client.NumPyClient):
         self.trainloader = trainloader
         self.valloader = valloader
         self.cid = cid
-        self.testloader=testloader
         self.device = device
         self.save_results = save_results
         self.matrix_path = matrix_path
@@ -163,17 +161,12 @@ class FlowerClient(fl.client.NumPyClient):
         set_parameters(self.net, parameters)
 
         criterion = torch.nn.CrossEntropyLoss()
-        optimizer = torch.optim.SGD(self.net.parameters(), lr=0.01,
-                                    momentum=0.9)
-        # torch.optim.RMSprop(net.parameters(), lr=lr)
+        optimizer = torch.optim.RMSprop(self.net.parameters(), lr=lr)
 
         # Start training
         results = engine.train(self.net, self.trainloader, self.valloader, optimizer=optimizer, loss_fn=criterion,
                                epochs=local_epochs, device=self.device, diff_privacy=False, delta=delta,
                                max_physical_batch_size=int(batch_size / 4), privacy_engine=self.privacy_engine)
-
-
-        #Encryption à la sortie des résultats
 
         # Save results
         if self.save_results:
@@ -193,7 +186,7 @@ class FlowerClient(fl.client.NumPyClient):
                 "Epochs", "Loss",
                 curve_labels=["Training loss", "Validation loss"], title="Loss curves",
                 path=self.save_results + f"Loss_curves_Client {self.cid}")
-        print(get_parameters2(self.net))
+
         return get_parameters2(self.net), len(self.trainloader), {}
 
     def evaluate(self, parameters, config):
@@ -202,7 +195,7 @@ class FlowerClient(fl.client.NumPyClient):
         set_parameters(self.net, parameters)
 
         # Evaluate global model parameters on the local test data
-        loss, accuracy, y_pred, y_true, y_proba = engine.test(self.net, self.testloader,
+        loss, accuracy, y_pred, y_true, y_proba = engine.test(self.net, self.valloader,
                                                               loss_fn=torch.nn.CrossEntropyLoss(), device=self.device)
 
         if self.save_results:
@@ -218,32 +211,38 @@ class FlowerClient(fl.client.NumPyClient):
 
 
 # The client-side execution (training, evaluation) from the server-side
-def client_fn(cid: str) -> FlowerClient:
-    """Create a Flower client representing a single organization."""
-
-    # Load data
-    """
-    Note: each client gets a different trainloader/valloader, so each client will train and evaluate on their 
-    own unique data
-    """
-    trainloader = trainloaders[int(cid)]
-    valloader = valloaders[int(cid)]
-
-    # Load model
-    net = model_builder.Net(num_classes=len(trainloader.dataset.dataset.dataset.classes)).to(DEVICE)
-    net.to(DEVICE)
-
-    
-    # Envoyer le modèle sur GPU s'il est disponible
-
-    # Create a  single Flower client representing a single organization
-    return FlowerClient(cid, net, trainloader, valloader, device=DEVICE, matrix_path=matrix_path,
-                        roc_path=roc_path, save_results=save_results, privacy_engine=None)
 
 
-fl.client.start_numpy_client(
-        server_address="localhost:"+str(5002),
-        client= client_fn('0'),
 
+
+strategy = fl.server.strategy.FedProx(
+    proximal_mu=0.2,
+    fraction_fit=frac_fit,  # Train on frac_fit % clients (each round)
+    fraction_evaluate=frac_eval,  # Sample frac_eval % of available clients for evaluation
+    min_fit_clients=min_fit_clients,  # Never sample less than 10 clients for training
+    min_evaluate_clients=number_clients//2 if min_eval_clients else min_eval_clients,  # Never sample less than 5 clients for evaluation
+    min_available_clients=min_avail_clients,  # Wait until all 10 clients are available
+    evaluate_metrics_aggregation_fn=weighted_average,  # <-- pass the metric aggregation function
+    initial_parameters=fl.common.ndarrays_to_parameters(get_parameters2(model_builder.Net(num_classes=NUM_CLASSES).to(DEVICE))),  # prevents Flower from asking one of the clients for the initial parameters
+    evaluate_fn=evaluate2,  # Pass the evaluation function
+    on_fit_config_fn=get_on_fit_config_fn(epoch=epochs, lr=lr, batch_size=batch_size),  # Pass the fit_config function
+)
+
+"""
+fl.simulation.start_simulation(
+    client_fn=client_fn,
+    num_clients=number_clients,
+    config=fl.server.ServerConfig(num_rounds=rounds),
+    strategy=strategy
+)
+"""
+
+
+# Start Flower server for three rounds of federated learning
+fl.server.start_server(
+        server_address = '172.16.2.1:'+str(5002) ,
+        config=fl.server.ServerConfig(num_rounds=rounds),
+        #grpc_max_message_length = 1024*1024*1024,
+        strategy = strategy
 )
 
