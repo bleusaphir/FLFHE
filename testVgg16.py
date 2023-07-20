@@ -195,7 +195,7 @@ def main():
         #On saute les biais dans l'assignation des poids
         param[i] = encrypt(paramToEncrypt)
 
-    print(f"[SUCCESS] : poids encryptés en {time.time() - startEn} secondes")
+    print(f"[SUCCESS] : poids encryptés en {time.time() - startEn}")
     import pickle
     test = pickle.dumps(param)
     otherW = param.copy()

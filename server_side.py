@@ -20,7 +20,8 @@ from typing import List, Tuple, Dict, Optional, Callable
 import flwr as fl
 import torch.nn.functional
 from flwr.common import Metrics
-from flwr.common import Metrics
+from flwr.common.logger import log
+from logging import INFO, WARN
 from collections import OrderedDict
 print("flwr", fl.__version__)
 print("numpy", np.__version__)
@@ -224,7 +225,7 @@ strategy = fl.server.strategy.FedProx(
     min_available_clients=min_avail_clients,  # Wait until all 10 clients are available
     evaluate_metrics_aggregation_fn=weighted_average,  # <-- pass the metric aggregation function
     initial_parameters=fl.common.ndarrays_to_parameters(get_parameters2(model_builder.Net(num_classes=NUM_CLASSES).to(DEVICE))),  # prevents Flower from asking one of the clients for the initial parameters
-    evaluate_fn=evaluate2,  # Pass the evaluation function
+    evaluate_fn=None,  # Pass the evaluation function
     on_fit_config_fn=get_on_fit_config_fn(epoch=epochs, lr=lr, batch_size=batch_size),  # Pass the fit_config function
 )
 
@@ -240,7 +241,7 @@ fl.simulation.start_simulation(
 
 # Start Flower server for three rounds of federated learning
 fl.server.start_server(
-        server_address = '172.16.2.1:'+str(5002) ,
+        server_address = 'localhost:'+str(5002) ,
         config=fl.server.ServerConfig(num_rounds=rounds),
         #grpc_max_message_length = 1024*1024*1024,
         strategy = strategy

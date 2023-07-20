@@ -15,24 +15,22 @@ import torchvision
 # Plot tool
 import matplotlib.pyplot as plt
 import torchvision
-from typing import List, Tuple, Dict, Optional, Callable
+from typing import List, Tuple, Dict, Optional, Callable, cast
 import flwr as fl
 import torch.nn.functional
 from flwr.common import Metrics
-from flwr.common import Metrics
+from flwr.common.typing import NDArray
 from collections import OrderedDict
-
-
-
+from flwr.common.logger import log
+from logging import INFO, WARN
 from Pyfhel import Pyfhel
-
 print("flwr", fl.__version__)
 print("numpy", np.__version__)
 print("torch", torch.__version__)
 print("torchvision", torchvision.__version__)
 from sklearn.metrics import classification_report
 device = "gpu"  #@param ["cpu", "cuda", "mps","gpu"] {type:"string"}
-number_clients = 2  #@param {type:"slider", min:3, max:10, step:1}
+number_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
 num_workers = -1
 epochs = 3  #@param {type:"slider", min:1, max:50, step:1}
 batch_size = 8 #@param [1, 2, 4, 8, 16, 32, 64, 128, 256] {type:"raw"}
@@ -66,7 +64,7 @@ min_fit_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
 min_eval_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
 min_avail_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
 
-trainloaders, valloaders, testloader = data_setup.load_datasets(num_clients=1, batch_size=batch_size,
+trainloaders, valloaders, testloader = data_setup.load_datasets(num_clients=3, batch_size=batch_size,
                                                                 resize=length, seed=seed,
                                                                 num_workers=num_workers, splitter=split, data_path=data_path)
 
@@ -216,17 +214,40 @@ class FlowerClient(fl.client.NumPyClient):
                 path=self.save_results + f"Loss_curves_Client {self.cid}")
         
         toEncrpyt = get_parameters2(self.net)
+        self.input_shapes = [p.shape for p in toEncrpyt]
+
 
         #Encryption à l'envoi des résultats
-
+        
+        log(INFO, "Model encryption...")
         encryptedWeights = encrypt(toEncrpyt)
-
+        log(INFO, "Model encryption ended.")
         return encryptedWeights, len(self.trainloader), {}
 
     def evaluate(self, parameters, config):
         """Evaluate parameters on the locally held test set."""
         print(f"[Client {self.cid}] evaluate, config: {config}")
-        set_parameters(self.net, parameters)
+        
+        print("[STATUS] : Decryption des poids en cours...")
+        decrypted = []
+
+        for weight, shape in zip(parameters, self.input_shapes):
+            decrypted.append(np.array(decrypt(weight,shape)).squeeze())
+
+        newParam = []
+        param = get_parameters2(self.net)
+        print(f"[SUCCESS] : decryption terminée. ")
+
+        print("[STATUS] : Construction du nouveau modèle en cours...")
+        for i in range(len(decrypted)) :
+            
+            if isinstance(decrypted[i], np.ndarray):
+                #Reshape les biais 
+                newParam.append(decrypted[i][:param[i].size])
+            else:
+                #Reshape les poids
+                newParam.append(decrypted[i].reshape(param[i].shape))
+        set_parameters(self.net, newParam)
 
         # Evaluate global model parameters on the local test data
         loss, accuracy, y_pred, y_true, y_proba = engine.test(self.net, self.testloader,
@@ -243,6 +264,39 @@ class FlowerClient(fl.client.NumPyClient):
         # Return results, including the custom accuracy metric
         return float(loss), len(self.valloader), {"accuracy": float(accuracy)}
 
+
+def decrypt(weight, shape):
+
+    #Fonction récursive pour encrypter chaque node ? 
+    #---- Shape (1,3,3) --> 1 array 3*3
+    #---- Shape (3,3) --> encrypter chaque array de la liste
+    decryptedWeights = []
+    
+    if not isinstance(weight, np.ndarray):
+        
+        decryptedWeights.append(HE.decryptFrac(weight)[:shape[-1]])
+
+    else :
+        print(weight,type(weight))
+        if len(weight.shape) == 0:
+            #Fix a bug when np.load() create à 0d-array.
+            decryptedWeights.append(HE.decryptFrac(weight.item())[:shape[-1]])
+        else: 
+            for w in weight :
+                
+                if isinstance(weight, np.ndarray):
+                    decryptedWeights.append(decrypt(w, shape))
+                    
+                else:
+                    
+                    _r = lambda x: np.round(x, decimals=8)
+                    decryptedWeights.append(_r(HE.decryptFrac(w)[:shape[-1]]))
+
+    
+            
+           
+        
+    return decryptedWeights
 
 
 def encrypt(weights):
@@ -297,12 +351,12 @@ def client_fn(cid: str) -> FlowerClient:
                         roc_path=roc_path, save_results=save_results, privacy_engine=None)
 
 if __name__ == "__main__" :
-    args = sys.argv[0:]
-    ip = args[0]
-    id_client = args[1]
+    args = sys.argv[1:]
+    id = args[0]
     fl.client.start_numpy_client(
-            server_address=ip+ ':' + str(5002),
-            client= client_fn(id_client),
-
+        
+            server_address='localhost'+ ':' + str(5002),
+            client= client_fn(id),
     )
+
 

@@ -192,6 +192,7 @@ class FlowerClient(fl.client.NumPyClient):
                 curve_labels=["Training loss", "Validation loss"], title="Loss curves",
                 path=self.save_results + f"Loss_curves_Client {self.cid}")
 
+        
         return get_parameters2(self.net), len(self.trainloader), {}
 
     def evaluate(self, parameters, config):
