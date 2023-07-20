@@ -28,7 +28,7 @@ print("torch", torch.__version__)
 print("torchvision", torchvision.__version__)
 from sklearn.metrics import classification_report
 device = "gpu"  #@param ["cpu", "cuda", "mps","gpu"] {type:"string"}
-number_clients = 2  #@param {type:"slider", min:3, max:10, step:1}
+number_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
 num_workers = -1
 epochs = 3  #@param {type:"slider", min:1, max:50, step:1}
 batch_size = 8 #@param [1, 2, 4, 8, 16, 32, 64, 128, 256] {type:"raw"}

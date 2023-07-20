@@ -24,6 +24,7 @@ from collections import OrderedDict
 
 
 
+from Pyfhel import Pyfhel
 
 print("flwr", fl.__version__)
 print("numpy", np.__version__)
@@ -31,7 +32,7 @@ print("torch", torch.__version__)
 print("torchvision", torchvision.__version__)
 from sklearn.metrics import classification_report
 device = "gpu"  #@param ["cpu", "cuda", "mps","gpu"] {type:"string"}
-number_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
+number_clients = 2  #@param {type:"slider", min:3, max:10, step:1}
 num_workers = -1
 epochs = 3  #@param {type:"slider", min:1, max:50, step:1}
 batch_size = 8 #@param [1, 2, 4, 8, 16, 32, 64, 128, 256] {type:"raw"}
@@ -69,6 +70,26 @@ trainloaders, valloaders, testloader = data_setup.load_datasets(num_clients=1, b
                                                                 resize=length, seed=seed,
                                                                 num_workers=num_workers, splitter=split, data_path=data_path)
 
+
+CKKSN = 2**13 #Réduction à 2**13 car problème de mémoire. Passage à 2**15 pour le support de davantage de modèle, mais hausse de la consommation en mémoire
+import sys
+HE = Pyfhel()           # Creating empty Pyfhel object
+ckks_params = {
+    'scheme': 'CKKS',   # can also be 'ckks'
+    'n': CKKSN,         # Polynomial modulus degree. For CKKS, n/2 values can be
+                        #  encoded in a single ciphertext. 
+                        #  Typ. 2^D for D in [10, 16]
+    'scale': 2**30,     # All the encodings will use it for float->fixed point
+                        #  conversion: x_fix = round(x_float * scale)
+                        #  You can use this as default scale or use a different
+                        #  scale on each operation (set in HE.encryptFrac)
+    'qi_sizes': [60, 30, 30, 30, 60] # Number of bits of each prime in the chain. 
+                        # Intermediate values should be  close to log2(scale)
+                        # for each operation, to have small rounding errors.
+}
+HE.contextGen(**ckks_params)  # Generate context for bfv scheme
+HE.keyGen()             # Key Generation: generates a pair of public/secret keys
+HE.rotateKeyGen()
 
 def get_parameters2(net) -> List[np.ndarray]:
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
