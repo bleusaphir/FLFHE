@@ -280,7 +280,7 @@ if __name__ == "__main__" :
     ip = args[0]
     id_client = args[1]
     fl.client.start_numpy_client(
-            server_address=ip+str(5002),
+            server_address=ip+ ':' + str(5002),
             client= client_fn(id_client),
 
     )
