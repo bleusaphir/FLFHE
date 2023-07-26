@@ -24,6 +24,8 @@ from collections import OrderedDict
 from flwr.common.logger import log
 from logging import INFO, WARN
 from Pyfhel import Pyfhel
+
+from test import ndarrays_to_parameters, parameters_to_ndarrays
 print("flwr", fl.__version__)
 print("numpy", np.__version__)
 print("torch", torch.__version__)
@@ -86,7 +88,8 @@ ckks_params = {
                         # for each operation, to have small rounding errors.
 }
 HE.contextGen(**ckks_params)  # Generate context for bfv scheme
-HE.keyGen()             # Key Generation: generates a pair of public/secret keys
+HE.load_public_key('public_key.key')
+HE.load_secret_key('private_key.key')
 HE.rotateKeyGen()
 
 def get_parameters2(net) -> List[np.ndarray]:
@@ -180,6 +183,15 @@ class FlowerClient(fl.client.NumPyClient):
 
         # Use values provided by the config
         print(f'[Client {self.cid}, round {server_round}] fit, config: {config}')
+        
+        self.input_shapes = [p.shape for p in get_parameters2(self.net)]
+        if server_round > 1 :
+            #Passé le round 1, les poids sont chiffrés de manière permaente
+            decrypted = []
+            for weight, shape in zip(parameters, self.input_shapes):
+                decrypted.append(np.array(decrypt(weight,shape)).squeeze())
+            parameters = decrypted
+
         set_parameters(self.net, parameters)
 
         criterion = torch.nn.CrossEntropyLoss()
@@ -213,15 +225,16 @@ class FlowerClient(fl.client.NumPyClient):
                 curve_labels=["Training loss", "Validation loss"], title="Loss curves",
                 path=self.save_results + f"Loss_curves_Client {self.cid}")
         
-        toEncrpyt = get_parameters2(self.net)
-        self.input_shapes = [p.shape for p in toEncrpyt]
-
-
-        #Encryption à l'envoi des résultats
         
+
+        toEncrpyt = get_parameters2(self.net)
+        #Encryption à l'envoi des résultats
         log(INFO, "Model encryption...")
         encryptedWeights = encrypt(toEncrpyt)
         log(INFO, "Model encryption ended.")
+
+
+        #Pas de soucis au niveau de la décryption, ni de l'encryption.
         return encryptedWeights, len(self.trainloader), {}
 
     def evaluate(self, parameters, config):
@@ -230,24 +243,16 @@ class FlowerClient(fl.client.NumPyClient):
         
         print("[STATUS] : Decryption des poids en cours...")
         decrypted = []
-
+        params = get_parameters2(self.net)
         for weight, shape in zip(parameters, self.input_shapes):
             decrypted.append(np.array(decrypt(weight,shape)).squeeze())
 
-        newParam = []
-        param = get_parameters2(self.net)
         print(f"[SUCCESS] : decryption terminée. ")
 
         print("[STATUS] : Construction du nouveau modèle en cours...")
-        for i in range(len(decrypted)) :
-            
-            if isinstance(decrypted[i], np.ndarray):
-                #Reshape les biais 
-                newParam.append(decrypted[i][:param[i].size])
-            else:
-                #Reshape les poids
-                newParam.append(decrypted[i].reshape(param[i].shape))
-        set_parameters(self.net, newParam)
+
+        
+        set_parameters(self.net, decrypted)
 
         # Evaluate global model parameters on the local test data
         loss, accuracy, y_pred, y_true, y_proba = engine.test(self.net, self.testloader,
@@ -277,7 +282,6 @@ def decrypt(weight, shape):
         decryptedWeights.append(HE.decryptFrac(weight)[:shape[-1]])
 
     else :
-        print(weight,type(weight))
         if len(weight.shape) == 0:
             #Fix a bug when np.load() create à 0d-array.
             decryptedWeights.append(HE.decryptFrac(weight.item())[:shape[-1]])
@@ -308,9 +312,7 @@ def encrypt(weights):
     encryptedWeights = []
     for w in weights:
         if len(w.shape) > 2 :
-            i+=1
-            print(f"Récursivité {i}")
-            
+
             encryptedWeights.append(encrypt(w))
         elif len(w.shape) == 1:
 

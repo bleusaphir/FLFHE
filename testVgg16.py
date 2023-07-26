@@ -64,6 +64,25 @@ def get_parameters2(net) -> List[np.ndarray]:
 def get_parameters3(state_dict) -> List[np.ndarray]:
     #Renvoie une liste avec les poids puis les biais de chaque couche
     return [val.cpu().numpy() for _, val in state_dict.items()]
+class Net(nn.Module):
+    def __init__(self, num_classes=10) -> None:
+        super(Net, self).__init__()
+        print("Number of classes : ", num_classes)
+        self.conv1 = nn.Conv2d(3, 6, 5)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(6, 16, 5)
+        self.fc1 = nn.Linear(16 * 5 * 5, 120)
+        self.fc2 = nn.Linear(120, 84)
+        self.fc3 = nn.Linear(84, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = x.view(-1, 16 * 5 * 5)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
 
 def encrypt(weights):
@@ -73,25 +92,29 @@ def encrypt(weights):
     #---- Shape (1,3,3) --> 1 array 3*3
     #---- Shape (3,3) --> encrypter chaque array de la liste
     encryptedWeights = []
-    for w in weights:
-        if len(w.shape) > 2 :
-            i+=1
-            print(f"Récursivité {i}")
-            
-            encryptedWeights.append(encrypt(w))
-        elif len(w.shape) == 1:
+    if len(weights.shape) == 1:
+        encryptedWeights.append(np.array(HE.encrypt(weights)))
 
-            encryptedWeights.append(HE.encrypt(w))
-        else:
+    else:
+        for w in weights:
+            if len(w.shape) > 2 :
+                i+=1
+                print(f"Récursivité {i}")
+                
+                encryptedWeights.append(np.array(encrypt(w)))
+            elif len(w.shape) == 1:
 
-                #Une limitation de taille de CKKSN / 2 par array chiffré est imposée par le module d'encryption.
-                #Afin de contourner ce modèle, on découpe l'array en sous array qu'on crypte par la suite, avant de les réunir à la fin
-                
-                #NB : Ne fonctionne pas car pas possible de refusionner les 2 arrays chiffrés comme des normaux
-                #_n = lambda x: np.split(x, list(range(0,len(node),CKKSN//2))[1:])
-                
-                
-                 encryptedWeights.append([HE.encrypt(node) for node in w])
+                encryptedWeights.append(np.array(HE.encrypt(w)))
+            else:
+
+                    #Une limitation de taille de CKKSN / 2 par array chiffré est imposée par le module d'encryption.
+                    #Afin de contourner ce modèle, on découpe l'array en sous array qu'on crypte par la suite, avant de les réunir à la fin
+                    
+                    #NB : Ne fonctionne pas car pas possible de refusionner les 2 arrays chiffrés comme des normaux
+                    #_n = lambda x: np.split(x, list(range(0,len(node),CKKSN//2))[1:])
+                    
+                    
+                    encryptedWeights.append(np.array([HE.encrypt(node) for node in w]))
 
     return encryptedWeights
 
@@ -100,23 +123,32 @@ def decrypt(weight, shape):
     #Fonction récursive pour encrypter chaque node ? 
     #---- Shape (1,3,3) --> 1 array 3*3
     #---- Shape (3,3) --> encrypter chaque array de la liste
-    encryptedWeights = []
+    decryptedWeights = []
     
-    if not isinstance(weight, list):
-        encryptedWeights.append(HE.decryptFrac(weight)[:shape[-1]])
+    if not isinstance(weight, np.ndarray):
+        
+        decryptedWeights.append(HE.decryptFrac(weight)[:shape[-1]])
 
     else :
-        for w in weight :
-            if isinstance(w, list):
-                encryptedWeights.append(decrypt(w, shape))
+        if len(weight.shape) == 0:
+            #Fix a bug when np.load() create à 0d-array.
+            decryptedWeights.append(HE.decryptFrac(weight.item())[:shape[-1]])
+        else: 
+            for w in weight :
                 
-            else:
-                _r = lambda x: np.round(x, decimals=8)
-                encryptedWeights.append(_r(HE.decryptFrac(w)[:shape[-1]]))
+                if isinstance(weight, np.ndarray):
+                    decryptedWeights.append(decrypt(w, shape))
+                    
+                else:
+                    
+                    _r = lambda x: np.round(x, decimals=8)
+                    decryptedWeights.append(_r(HE.decryptFrac(w)[:shape[-1]]))
+
+    
             
            
         
-    return encryptedWeights
+    return decryptedWeights
 
 def aggregation(N,weights):
 
@@ -136,18 +168,25 @@ def aggregation(N,weights):
     #Dans ce cas-ci : 7
     for l in weights :
 
-        if not isinstance(l[0], list):
+        if not isinstance(l[0], np.ndarray):
             #Poids à une seule dimension
             moy.append(sum(l)/2)
     #tous les Models ont la même structure
         else :
-            if isinstance(l[0][0], list):
-                #Encore 2 dimensions de couches
-                moy.append(aggregation(N, list(zip(*l))))
+            try:
+                if l[0].shape == 0:
+                    moy.append(sum(weights)/N)
+            except AttributeError:
+                if isinstance(l[0], np.ndarray):
+                    #Poids à une seule dimension
+                    moy.append(sum(l)/N)
+                if isinstance(l[0][0], np.ndarray):
+                    #Encore 2 dimensions de couches
+                    moy.append(aggregation(N, list(zip(*l))))
 
-            else:
-                #Une liste de poids cryptés
-                moy.append(moy_agg(l,N))
+                else:
+                    #Une liste de poids cryptés
+                    moy.append(moy_agg(l,N))
     return moy
 
 def moy_agg(l,N):
@@ -173,10 +212,8 @@ def set_parameters(net, parameters: List[np.ndarray]):
 
 
 def main():
-    model = get_vgg()
+    model = Net()
 
-    nEcrypt = 1 #Nombres de couches à encrypter
-    fe = 0.2 #Fraction of the layer to encrypt
 
     startEn = time.time()
 
@@ -185,21 +222,15 @@ def main():
     input_shapes = [p.shape for p in param]
 
 
-    encryptedWeights = []
-    paramToEncrypt = param[:nEcrypt*2:2]
     #print(param[1][0].nbytes, sys.getsizeof(HE.encrypt(param[1])))
 
-    for i in range(0,len(param),2):
-        if i > nEcrypt:
-            break
-        #On saute les biais dans l'assignation des poids
-        param[i] = encrypt(paramToEncrypt)
+
+
+    enc = [np.array(encrypt(p)) for p in param]
 
     print(f"[SUCCESS] : poids encryptés en {time.time() - startEn}")
-    import pickle
-    test = pickle.dumps(param)
+
     otherW = param.copy()
-    retest = pickle.loads(test)
     weights = []
     weights.append(otherW)
     weights.append(param)
@@ -209,19 +240,16 @@ def main():
 
     startAg = time.time()
     print("[STATUS] : Agreggation des poids en cours...")
-    moy = aggregation(N,weights)
+    moy = aggregation(N,enc)
     print(f"[SUCCESS] : aggregation en {time.time() - startAg}")
 
     startdec = time.time()
     print("[STATUS] : Decryption des poids en cours...")
 
-    for i in range(0,len(param),2):
-        if i > nEcrypt:
-            param[i] = moy[i]
-        else :
-            foo = decrypt(param[i], input_shapes[i])
-            #Ne décrypte que les couches chiffrées --> les nEncrypt entrées paires de param
-            param[i] = np.array(foo, dtype="float32").reshape(input_shapes[i])
+    decrypted = []
+    for weight, shape in zip(moy, input_shapes):
+        decrypted.append(decrypt(weight,shape))
+        
     
 
 
@@ -235,4 +263,5 @@ def main():
     print(set_parameters(model, param))
     print(f"[SUCCESS] : nouveau modèle construit en {time.time() - startcons}")
 
-main()
+if __name__ == "__main__":
+    main()

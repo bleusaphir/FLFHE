@@ -14,14 +14,29 @@ from going_modular.common import *
 from going_modular import model_builder, data_setup, engine
 import torchvision
 # Plot tool
-import matplotlib.pyplot as plt
+from flwr.common import (
+    EvaluateIns,
+    EvaluateRes,
+    FitIns,
+    FitRes,
+    MetricsAggregationFn,
+    NDArrays,
+    Parameters,
+    Scalar,
+    ndarrays_to_parameters,
+    parameters_to_ndarrays,
+)
+from logging import WARNING
+from typing import Callable, Dict, List, Optional, Tuple, Union
+from flwr.common import FitIns, MetricsAggregationFn, NDArrays, Parameters, Scalar
+from flwr.common.logger import log
+from flwr.server.client_proxy import ClientProxy
 import torchvision
 from typing import List, Tuple, Dict, Optional, Callable
 import flwr as fl
 import torch.nn.functional
 from flwr.common import Metrics
 from flwr.common.logger import log
-from logging import INFO, WARN
 from collections import OrderedDict
 print("flwr", fl.__version__)
 print("numpy", np.__version__)
@@ -54,9 +69,164 @@ print(CLASSES)
 NUM_CLASSES = 10
 
 
+from flwr.server.strategy.fedavg import FedAvg
+
+WARNING_MIN_AVAILABLE_CLIENTS_TOO_LOW = """
+Setting `min_available_clients` lower than `min_fit_clients` or
+`min_evaluate_clients` can cause the server to fail when there are too few clients
+connected to the server. `min_available_clients` must be set to a value larger
+than or equal to the values of `min_fit_clients` and `min_evaluate_clients`.
+"""
+def aggregate(results: List[Tuple[NDArrays, int]]) -> NDArrays:
+    from functools import reduce
+    """Compute weighted average."""
+    # Calculate the total number of examples used during training
+    #print(f"[DEBUG] : num_examples[0] = {results[0][1]}, supposed '15000' ")
+    #print(f"[DEBUG] : results[0] = {results[0][0]}, supposed ndarray of Pyfhel objets ")
+
+    num_examples_total = sum([num_examples for _, num_examples in results])
+
+    # Create a list of weights, each multiplied by the related number of examples
+    weights = [
+        w for w, _ in results
+    ]
+
+    weights_prime = aggregation(len(results), weights)
+    # Compute average weights of each layery
+
+    
+    # weights_prime: NDArrays = [
+    #     reduce(np.add, layer_update s) / len(results)
+    #     for layer_updates in zip(*weighted_weights)
+    # ]
+    return weights_prime
+
+def aggregation(N,weights):
+
+    """
+    Applique la mise en commun des modèles de chaque client.
+
+    Parameters:
+    l (tuple) : tuple contenant les poids de la couche de chaque client.
+    N (int) : Nombre de client participant au FL.
+
+    Returns:
+    list: moyenne des poids des clients
 
 
-rounds = 25   #@param {type:"slider", min:1, max:50, step:1}
+    """
+    moy = []
+    #Dans ce cas-ci : 7
+
+    if not isinstance(weights[0], list) and len(weights[0].shape) == 0:
+         moy.append(sum([w.item() for w in weights])/N)
+
+
+    elif isinstance(weights[0][0], np.ndarray):
+        for i in range(len(weights[0])):
+            moy.append(np.array(aggregation(N, [w[i] for w in weights])))
+    else:
+        return moy_agg([w for w in weights], N)
+
+
+
+    return moy
+
+def moy_agg(l,N):
+    """
+    Fonction d'aggregation effectuant une moyenne simple des poids des clients.
+
+    Parameters:
+    l (tuple) : tuple contenant les poids de la couche de chaque client.
+    N (int) : Nombre de client participant au FL.
+
+    Returns:
+    list: moyenne des poids des clients
+
+    List[num_clients][taille_couche]
+    """
+    return [sum(l[n][k] for n in range(N))/N for k in range(len(l[0]))]
+
+
+
+
+
+
+class CustomStrategy(FedAvg):
+
+    def __init__(
+        self,
+        *,
+        fraction_fit: float = 1.0,
+        fraction_evaluate: float = 1.0,
+        min_fit_clients: int = 2,
+        min_evaluate_clients: int = 2,
+        min_available_clients: int = 2,
+        evaluate_fn: Optional[
+            Callable[
+                [int, NDArrays, Dict[str, Scalar]],
+                Optional[Tuple[float, Dict[str, Scalar]]],
+            ]
+        ] = None,
+        on_fit_config_fn: Optional[Callable[[int], Dict[str, Scalar]]] = None,
+        on_evaluate_config_fn: Optional[Callable[[int], Dict[str, Scalar]]] = None,
+        accept_failures: bool = True,
+        initial_parameters: Optional[Parameters] = None,
+        fit_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
+        evaluate_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
+    ) -> None:
+        if (
+            min_fit_clients > min_available_clients
+            or min_evaluate_clients > min_available_clients
+        ):
+            log(WARNING, WARNING_MIN_AVAILABLE_CLIENTS_TOO_LOW)
+    
+        super().__init__(
+            fraction_fit=fraction_fit,
+            fraction_evaluate=fraction_evaluate,
+            min_fit_clients=min_fit_clients,
+            min_evaluate_clients=min_evaluate_clients,
+            min_available_clients=min_available_clients,
+            evaluate_fn=evaluate_fn,
+            on_fit_config_fn=on_fit_config_fn,
+            on_evaluate_config_fn=on_evaluate_config_fn,
+            accept_failures=accept_failures,
+            initial_parameters=initial_parameters,
+            fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
+            evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
+        )
+
+
+    def aggregate_fit(
+        self,
+        server_round: int,
+        results: List[Tuple[ClientProxy, FitRes]],
+        failures: List[Union[Tuple[ClientProxy, FitRes], BaseException]],
+    ) -> Tuple[Optional[Parameters], Dict[str, Scalar]]:
+        """Aggregate fit results using weighted average."""
+        if not results:
+            return None, {}
+        # Do not aggregate if there are failures and failures are not accepted
+        if not self.accept_failures and failures:
+            return None, {}
+
+        # Convert results
+        weights_results = [
+            (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
+            for _, fit_res in results
+        ]
+        parameters_aggregated = ndarrays_to_parameters(aggregate(weights_results))
+
+        # Aggregate custom metrics if aggregation fn was provided
+        metrics_aggregated = {}
+        if self.fit_metrics_aggregation_fn:
+            fit_metrics = [(res.num_examples, res.metrics) for _, res in results]
+            metrics_aggregated = self.fit_metrics_aggregation_fn(fit_metrics)
+        elif server_round == 1:  # Only log this warning once
+            log(WARNING, "No fit_metrics_aggregation_fn provided")
+
+        return parameters_aggregated, metrics_aggregated
+rounds = 25   #@param {type:"slider", min:1, max:50, step:1}    
 frac_fit = 1  #@param {type:"slider", min:0.1, max:1.0, step:0.1}
 frac_eval = 0.5  #@param {type:"slider", min:0.1, max:1.0, step:0.1}
 min_fit_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
@@ -216,12 +386,11 @@ class FlowerClient(fl.client.NumPyClient):
 
 
 
-strategy = fl.server.strategy.FedProx(
-    proximal_mu=0.2,
+strategy = CustomStrategy(
     fraction_fit=frac_fit,  # Train on frac_fit % clients (each round)
     fraction_evaluate=frac_eval,  # Sample frac_eval % of available clients for evaluation
     min_fit_clients=min_fit_clients,  # Never sample less than 10 clients for training
-    min_evaluate_clients=number_clients//2 if min_eval_clients else min_eval_clients,  # Never sample less than 5 clients for evaluation
+    min_evaluate_clients=2 if min_eval_clients else min_eval_clients,  # Never sample less than 5 clients for evaluation
     min_available_clients=min_avail_clients,  # Wait until all 10 clients are available
     evaluate_metrics_aggregation_fn=weighted_average,  # <-- pass the metric aggregation function
     initial_parameters=fl.common.ndarrays_to_parameters(get_parameters2(model_builder.Net(num_classes=NUM_CLASSES).to(DEVICE))),  # prevents Flower from asking one of the clients for the initial parameters
