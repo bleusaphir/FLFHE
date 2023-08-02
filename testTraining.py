@@ -12,8 +12,16 @@ from typing import List, Tuple, Dict, Optional, Callable
 from Pyfhel import Pyfhel
 import torchmetrics
 import time
+import pandas as pd
+from going_modular.common import *
+import psutil
+from psutil._common import bytes2human
+device = "gpu"
+DEVICE = torch.device(choice_device(device))
 
-CKKSN = 2**15
+from going_modular import model_builder, data_setup, engine
+CKKSN = 2**15 #Réduction à 2**13 car problème de mémoire. Passage à 2**15 pour le support de davantage de modèle, mais hausse de la consommation en mémoire
+import sys
 HE = Pyfhel()           # Creating empty Pyfhel object
 ckks_params = {
     'scheme': 'CKKS',   # can also be 'ckks'
@@ -28,9 +36,9 @@ ckks_params = {
                         # Intermediate values should be  close to log2(scale)
                         # for each operation, to have small rounding errors.
 }
-HE.contextGen(**ckks_params)  # Generate context for bfv scheme
-HE.keyGen()             # Key Generation: generates a pair of public/secret keys
+HE.contextGen(**ckks_params)  # Generate context for bfv scheme            # Key Generation: generates a pair of public/secret keys
 HE.rotateKeyGen()
+HE.keyGen()
 import torchvision
 
 class Net(nn.Module):
@@ -86,27 +94,35 @@ import torch.nn.functional as F
 
 import torch.nn as nn
 import torch.nn.functional as F
+import psutil
 
 
-
-def test(model, device, test_loader):
+def test(model, device, test_loader, save_results, matrix_path, roc_path):
     model.eval()
 
     test_loss = 0
     correct = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            test_loss += F.nll_loss(output, target, reduction='sum').item()  # sum up batch loss
-            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            correct += pred.eq(target.view_as(pred)).sum().item()
+    loss, accuracy, y_pred, y_true, y_proba = engine.test(model, test_loader,
+                                                              loss_fn=torch.nn.CrossEntropyLoss(), device=DEVICE)
+    CLASSES = (
+        "0 - zero",
+        "1 - one",
+        "2 - two",
+        "3 - three",
+        "4 - four",
+        "5 - five",
+        "6 - six",
+        "7 - seven",
+        "8 - eight",
+        "9 - nine",
+    )
+    if save_results:
+            os.makedirs(save_results, exist_ok=True)
+            if matrix_path:
+                save_matrix(y_true, y_pred, save_results + matrix_path, CLASSES)
 
-    test_loss /= len(test_loader.dataset)
-
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
+            if roc_path:
+                save_roc(y_true, y_proba, save_results + roc_path, 10)
     
 
 def get_parameters2(net) -> List[np.ndarray]:
@@ -138,6 +154,8 @@ def encrypt(weights):
         elif len(w.shape) == 1:
             encryptedWeights.append(HE.encrypt(w))
         else:
+                
+                
 
                 #Une limitation de taille de CKKSN / 2 par array chiffré est imposée par le module d'encryption.
                 #Afin de contourner ce modèle, on découpe l'array en sous array qu'on crypte par la suite, avant de les réunir à la fin
@@ -146,7 +164,7 @@ def encrypt(weights):
                 #_n = lambda x: np.split(x, list(range(0,len(node),CKKSN//2))[1:])
                 
                 
-                 encryptedWeights.append([HE.encrypt(node) for node in w])
+                encryptedWeights.append([HE.encrypt(node) for node in w])
         
     return encryptedWeights
 
@@ -226,17 +244,19 @@ def moy_agg(l,N):
     """
     return [sum(l[n][k] for n in range(N))/N for k in range(len(l[0]))]
 
-def main():
+
+
+def main(N):
     model = get_vgg()
     
-    start_time = time.time()
+    
     # Training settings
     parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
                         help='input batch size for training (default: 64)')
     parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                         help='input batch size for testing (default: 1000)')
-    parser.add_argument('--epochs', type=int, default=14, metavar='N',
+    parser.add_argument('--epochs', type=int, default=2, metavar='N',
                         help='number of epochs to train (default: 14)')
     parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
                         help='learning rate (default: 1.0)')
@@ -255,6 +275,10 @@ def main():
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
     args = parser.parse_args()
+
+
+
+    
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     use_mps = not args.no_mps and torch.backends.mps.is_available()
     
@@ -293,6 +317,8 @@ def main():
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     
     for epoch in range(1, args.epochs + 1):
+        n_couches = len(get_parameters2(model))//2
+        start_time = time.time()
         train(args, model, device, train_loader, optimizer, epoch)
 
         
@@ -300,61 +326,108 @@ def main():
         
         startEn = time.time()
         print("[STATUS] : Encryption des poids en cours...")
-        param = get_parameters2(model)
-        encryptedWeights = encrypt(param)
-        print(f"[SUCCESS] : poids encryptés en {time.time() - startEn}")
-        otherW = encryptedWeights.copy()
-        weights = []
-        weights.append(otherW)
-        weights.append(encryptedWeights)
-        weights = list(zip(*weights))
-        N = 2 #[ModelW1, ModelW2,..., ModelWn] avec N = nClients
+        try :
+            param = get_parameters2(model)
 
-        startAg = time.time()
-        print("[STATUS] : Agreggation des poids en cours...")
-        moy = aggregation(N,weights)
-        print(f"[SUCCESS] : aggregation en {time.time() - startAg}")
+            encryptedWeights = encrypt(param)
+            print(f"[SUCCESS] : poids encryptés en {time.time() - startEn}")
+            ram_enc = bytes2human(psutil.virtual_memory().used)
+            total_ram_enc = bytes2human(psutil.swap_memory().used + psutil.virtual_memory().used)
+            encTime = time.time() - startEn
+            weights = []
+            for i in range(N):
+                weights.append(encryptedWeights.copy())
+            weights = list(zip(*weights))
 
-        startdec = time.time()
-        print("[STATUS] : Decryption des poids en cours...")
-        decrypted = []
-        input_shapes = [p.shape for p in param]
-        for weight, shape in zip(moy, input_shapes):
-            decrypted.append(decrypt(weight,shape))
-        
-        newParam = []
-        print(f"[SUCCESS] : decryption en {time.time() - startdec}")
-        #4D : Conv
-        #2D : Linear
-        #1D : biais
-        startcons = time.time()
-        print("[STATUS] : Construction du nouveau modèle en cours...")
-        for i in range(len(decrypted)) :
+            ram_serv = bytes2human(psutil.virtual_memory().used)
+            total_ram_serv = bytes2human(psutil.swap_memory().used + psutil.virtual_memory().used)
+            # Getting % usage of virtual_memory ( 3rd field)
+            startAg = time.time()
+            print("[STATUS] : Agreggation des poids en cours...")
+            moy = aggregation(N,weights)
+            ram_agg = bytes2human(psutil.virtual_memory().used)
+            total_ram_agg = bytes2human(psutil.swap_memory().used + psutil.virtual_memory().used)
+            print(f"[SUCCESS] : aggregation en {time.time() - startAg}")
+
+            aggTime = time.time() - startAg
+
+            startdec = time.time()
+           
+            print("[STATUS] : Decryption des poids en cours...")
+            decrypted = []
+            input_shapes = [p.shape for p in param]
+            for weight, shape in zip(moy, input_shapes):
+                decrypted.append(decrypt(weight,shape))
             
-            if isinstance(decrypted[i], np.ndarray):
-                #Reshape les biais 
-                newParam.append(np.array(decrypted[i][:param[i].size]))
-            else:
-                #Reshape les poids
-                newParam.append(np.array(decrypted[i], dtype="float32").reshape(param[i].shape))
-        
-        
-        
-        set_parameters(model, newParam)
-        print(f"[SUCCESS] : nouveau modèle construit en {time.time() - startcons}")
-        test(model, device, test_loader)
+            newParam = []
+            
+            print(f"[SUCCESS] : decryption en {time.time() - startdec}")
+            #4D : Conv
+            #2D : Linear
+            #1D : biais
+            decryptTime = time.time() - startdec
+            startcons = time.time()
+            print("[STATUS] : Construction du nouveau modèle en cours...")
+            for i in range(len(decrypted)) :
+                
+                if isinstance(decrypted[i], np.ndarray):
+                    #Reshape les biais 
+                    newParam.append(np.array(decrypted[i][:param[i].size]))
+                else:
+                    #Reshape les poids
+                    newParam.append(np.array(decrypted[i], dtype="float32").reshape(param[i].shape))
+            
+            ram_dec = bytes2human(psutil.virtual_memory().used)
+            total_ram_dec = bytes2human(psutil.swap_memory().used + psutil.virtual_memory().used)
+            set_parameters(model, newParam)
+            print(f"[SUCCESS] : nouveau modèle construit en {time.time() - startcons}")
+            test(model, device, test_loader, f"results{1}/", "matrix.png", "roc.png")
+            success = "SUCCESS"
+        except Exception as e:
+            print(f"[FAILED] : {e}, Probably memory error.")
+            success = "Failure"
 
-
-        print(f"Epoch {epoch} en {time.time() - start_time}")
+        epochTime = time.time() - start_time
+        print(f"Epoch {epoch} en {epochTime}")
         scheduler.step()
 
+    total_time = time.time() - start_time
+    data = {
+        'n_clients' : [N],
+        'n_couches' : [n_couches],
+        'epochs' : [args.epochs],
+        'learning_rate' : [args.lr],
+        "Encryption_time" : [encTime],
+        "Aggregation_time" : [aggTime],
+        "Decryption_Time" : [decryptTime],
+        "Epoch_time" : [epochTime],
+        "total_time" : [total_time],
+        "RAM_enc" : [ram_enc],
+        "RAM_serv" : [ram_serv],
+        "RAM_agg" : [ram_agg],
+        "RAM_dec" : [ram_dec],
+        "Total_Mem_enc" : [total_ram_enc],
+        "Total_Mem_serv" : [total_ram_serv],
+        "Total_Mem_agg" : [total_ram_agg],
+        "Total_Mem_dec" : [total_ram_dec],
+        "CKKSN" : [CKKSN],
+        'Success' : [success]
+
+    }
+    
     if args.save_model:
         torch.save(model.state_dict(), "mnist_cnn.pt")
 
 
+    df = pd.DataFrame(data)
 
+    # Étape 5 : Exportez le DataFrame vers un fichier Excel
+    nom_fichier_excel = f"resultats_entrainement{N}.xlsx"
+    df.to_excel(nom_fichier_excel, index=False)
 
 
 if __name__ == '__main__':
-    main()
+    n = 16 # Nombre clients
+
+    main(n)
 

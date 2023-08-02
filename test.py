@@ -12,6 +12,9 @@ from torch.optim.lr_scheduler import StepLR
 from typing import List, Tuple, Dict, Optional, Callable
 from Pyfhel import Pyfhel
 import torchmetrics
+import psutil
+ 
+
 import time
 from flwr.common import serde
 from flwr.common.typing import NDArray, NDArrays, Parameters
