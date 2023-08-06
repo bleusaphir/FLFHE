@@ -1,4 +1,7 @@
+from io import BytesIO
 import sys
+import time
+from psutil import Process
 import torch
 import torch.nn as nn
 import torchvision
@@ -9,12 +12,11 @@ from torchvision import transforms
 import numpy as np
 from glob import glob
 from going_modular.common import *
-
+from functools import wraps
 from going_modular import model_builder, data_setup, engine
 import torchvision
 # Plot tool
 import matplotlib.pyplot as plt
-import torchvision
 from typing import List, Tuple, Dict, Optional, Callable, cast
 import flwr as fl
 import torch.nn.functional
@@ -34,13 +36,13 @@ from sklearn.metrics import classification_report
 device = "gpu"  #@param ["cpu", "cuda", "mps","gpu"] {type:"string"}
 number_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
 num_workers = -1
-epochs = 3  #@param {type:"slider", min:1, max:50, step:1}
+epochs = 5  #@param {type:"slider", min:1, max:50, step:1}
 batch_size = 8 #@param [1, 2, 4, 8, 16, 32, 64, 128, 256] {type:"raw"}
 data_path = "./Clients/"
 model_save = "model1.pt"
 matrix_path = "confusion_matrix.png"  # None
 roc_path = "roc.png"  # None
-save_results = "results/classic/"  #@param ["", "results/FL/", "results/classic/"] {type:"string"}
+
 dataset = "cifar"  #@param ["cifar", "animaux", "breast"] {type:"string"}
 split = 10  #@param {type:"slider", min:5, max:100, step:5}
 seed = 42
@@ -55,22 +57,32 @@ print(f"Training on {DEVICE} using PyTorch {torch.__version__}")
 CLASSES = classes_string(dataset)
 print(CLASSES)
 NUM_CLASSES = 10
+import psutil
+DATA = {
+        "round" : [],
+        "Temps_encrypt" : [],
+        "Ram_available_start" : [],
+        "Temps_evaluate" : [],
+        "Temps_fit" : [],
+        "accuracy": [],
+        "loss" : [],
+        "RAM_Enc" : [],
+        "RAM_Dec" : []}
+
+Config = {
+    "lr" : [lr],
+    "batch_size" : [batch_size],
+    "n_clients" : [number_clients],
+    "n_Epochs" : [epochs]
+}
+from psutil._common import bytes2human
 
 
-
-
-rounds =10  #@param {type:"slider", min:1, max:50, step:1}
-frac_fit = 1  #@param {type:"slider", min:0.1, max:1.0, step:0.1}
-frac_eval = 0.5  #@param {type:"slider", min:0.1, max:1.0, step:0.1}
-min_fit_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
-min_eval_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
-min_avail_clients = 3  #@param {type:"slider", min:3, max:10, step:1}
-
-trainloaders, valloaders, testloader = data_setup.load_datasets(num_clients=3, batch_size=batch_size,
+trainloaders, valloaders, testloader = data_setup.load_datasets(num_clients=number_clients, batch_size=batch_size,
                                                                 resize=length, seed=seed,
                                                                 num_workers=num_workers, splitter=split, data_path=data_path)
 
-
+save_results = f"resultsClients{number_clients}/graph/"  #@param ["", "results/FL/", "results/classic/"] {type:"string"}
 CKKSN = 2**13 #Réduction à 2**13 car problème de mémoire. Passage à 2**15 pour le support de davantage de modèle, mais hausse de la consommation en mémoire
 import sys
 HE = Pyfhel()           # Creating empty Pyfhel object
@@ -91,6 +103,39 @@ HE.contextGen(**ckks_params)  # Generate context for bfv scheme
 HE.load_public_key('public_key.key')
 HE.load_secret_key('private_key.key')
 HE.rotateKeyGen()
+
+def timeit(func):
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        DATA[f'Temps_{func.__name__}'].append("%.2f"%total_time)
+        return result
+    return timeit_wrapper
+
+def ndarray_to_bytes(ndarray: NDArray) -> bytes:
+    """Serialize NumPy ndarray to bytes."""
+    bytes_io = BytesIO()
+    # WARNING: NEVER set allow_pickle to true.
+    # Reason: loading pickled data can execute arbitrary code
+    # Source: https://numpy.org/doc/stable/reference/generated/numpy.save.html
+    np.save(bytes_io, ndarray, allow_pickle=True)  # type: ignore
+    return bytes_io.getvalue()
+
+
+def bytes_to_ndarray(tensor: bytes) -> NDArray:
+    """Deserialize NumPy ndarray from bytes."""
+    bytes_io = BytesIO(tensor)
+    # WARNING: NEVER set allow_pickle to true.
+    # Reason: loading pickled data can execute arbitrary code
+    # Source: https://numpy.org/doc/stable/reference/generated/numpy.load.html
+    ndarray_deserialized = np.load(bytes_io, allow_pickle=True)  # type: ignore
+    return cast(NDArray, ndarray_deserialized)
+
+fl.common.parameter.ndarray_to_bytes = ndarray_to_bytes
+fl.common.parameter.bytes_to_ndarray = bytes_to_ndarray
 
 def get_parameters2(net) -> List[np.ndarray]:
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
@@ -130,11 +175,12 @@ def evaluate2(server_round: int, parameters: fl.common.NDArrays, config: Dict[st
     set_parameters(net, parameters)  # Update model with the latest parameters
     loss, accuracy, y_pred, y_true, y_proba = engine.test(net, testloader, loss_fn=torch.nn.CrossEntropyLoss(),
                                                           device=DEVICE)
+
     print(f"Server-side evaluation loss {loss} / accuracy {accuracy}")
     return loss, {"accuracy": accuracy}
 
 
-def get_on_fit_config_fn(epoch=2, lr=0.01, batch_size=32) -> Callable[[int], Dict[str, str]]:
+def get_on_fit_config_fn(epoch=3, lr=0.01, batch_size=32) -> Callable[[int], Dict[str, str]]:
     """Return a function which returns training configurations."""
 
     def fit_config(server_round: int) -> Dict[str, str]:
@@ -146,7 +192,7 @@ def get_on_fit_config_fn(epoch=2, lr=0.01, batch_size=32) -> Callable[[int], Dic
             "learning_rate": str(lr),
             "batch_size": str(batch_size),
             "server_round": server_round,  # The current round of federated learning
-            "local_epochs": 1 if server_round < 2 else epoch,
+            "local_epochs": 3 if server_round < 2 else epoch,
         }
         print(server_round)
         return config
@@ -175,12 +221,15 @@ class FlowerClient(fl.client.NumPyClient):
         print(f"[Client {self.cid}] get_parameters")
         return get_parameters2(self.net)
 
+    @timeit
     def fit(self, parameters, config):
         # Read values from config
+        
         server_round = config['server_round']
         local_epochs = config['local_epochs']
         lr = float(config["learning_rate"])
-
+        DATA['Ram_available_start'].append(bytes2human(psutil.virtual_memory().available))
+        DATA["round"].append(server_round)
         # Use values provided by the config
         print(f'[Client {self.cid}, round {server_round}] fit, config: {config}')
         
@@ -231,22 +280,26 @@ class FlowerClient(fl.client.NumPyClient):
         #Encryption à l'envoi des résultats
         log(INFO, "Model encryption...")
         encryptedWeights = encrypt(toEncrpyt)
+        process = psutil.Process()
+        DATA["RAM_Enc"].append(bytes2human(process.memory_info().rss))
         log(INFO, "Model encryption ended.")
 
 
         #Pas de soucis au niveau de la décryption, ni de l'encryption.
         return encryptedWeights, len(self.trainloader), {}
 
+    @timeit
     def evaluate(self, parameters, config):
         """Evaluate parameters on the locally held test set."""
         print(f"[Client {self.cid}] evaluate, config: {config}")
-        
+        self.input_shapes = [p.shape for p in get_parameters2(self.net)]
         print("[STATUS] : Decryption des poids en cours...")
         decrypted = []
-        params = get_parameters2(self.net)
+        
         for weight, shape in zip(parameters, self.input_shapes):
             decrypted.append(np.array(decrypt(weight,shape)).squeeze())
-
+        process = psutil.Process()
+        DATA["RAM_Dec"].append(bytes2human(process.memory_info().rss))
         print(f"[SUCCESS] : decryption terminée. ")
 
         print("[STATUS] : Construction du nouveau modèle en cours...")
@@ -265,7 +318,8 @@ class FlowerClient(fl.client.NumPyClient):
 
             if self.roc_path:
                 save_roc(y_true, y_proba, self.save_results + self.roc_path, NUM_CLASSES)
-
+        DATA["accuracy"].append(accuracy)
+        DATA["loss"].append(loss)
         # Return results, including the custom accuracy metric
         return float(loss), len(self.valloader), {"accuracy": float(accuracy)}
 
@@ -303,6 +357,8 @@ def decrypt(weight, shape):
     return decryptedWeights
 
 
+
+@timeit
 def encrypt(weights):
 
     i = 0
@@ -357,8 +413,22 @@ if __name__ == "__main__" :
     id = args[0]
     fl.client.start_numpy_client(
         
-            server_address='localhost'+ ':' + str(5002),
+            server_address='172.16.2.1'+ ':' + str(5002),
             client= client_fn(id),
     )
+    print(DATA)
+    df = pd.DataFrame(DATA)
 
-
+    import os
+    path = f"resultsClients{number_clients}"
+    # Check whether the specified path exists or not
+    
+    if not os.path.exists(path):
+        # Create a new directory because it does not exist
+        os.makedirs(path)
+    
+    # Étape 5 : Exportez le DataFrame vers un fichier Excel
+    nom_fichier_excel = f"{path}/resultats_entrainement_client{id}.xlsx"
+    df.to_excel(nom_fichier_excel, index=False)
+    df_config = pd.DataFrame(Config)
+    df_config.to_excel(f"{path}/config_client{id}.xlsx", index=False)
